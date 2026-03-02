@@ -1,0 +1,472 @@
+#include <ESP32Servo.h>
+
+// Пины для подключения сервоприводов
+const int PAN_SERVO_PIN = 18;    // Пин для сервопривода Pan (горизонтальное вращение)
+const int TILT_SERVO_PIN = 19;   // Пин для сервопривода Tilt (вертикальное вращение)
+
+// Пины для приема сигналов с радиоприемника
+const int PAN_INPUT_PIN = 4;     // Пин для приема PWM сигнала Pan канала
+const int TILT_INPUT_PIN = 5;    // Пин для приема PWM сигнала Tilt канала
+
+// НАСТРОЙКИ ИНВЕРТИРОВАНИЯ КАНАЛОВ
+bool invertPan = false;           // true - инвертировать Pan канал, false - нормальное направление
+bool invertTilt = false;          // true - инвертировать Tilt канал, false - нормальное направление
+
+// НАСТРОЙКИ ОГРАНИЧЕНИЯ УГЛОВ ПОВОРОТА (в градусах)
+int panMinAngle = 30;             // Минимальный угол для Pan сервопривода (0-180)
+int panMaxAngle = 150;            // Максимальный угол для Pan сервопривода (0-180)
+int tiltMinAngle = 55;            // Минимальный угол для Tilt сервопривода (0-180)
+int tiltMaxAngle = 125;           // Максимальный угол для Tilt сервопривода (0-180)
+
+// Создаем объекты для сервоприводов
+Servo panServo;
+Servo tiltServo;
+
+// Переменные для хранения длительности импульсов
+volatile unsigned long panPulseStart = 0;
+volatile unsigned long panPulseWidth = 1500;  // Инициализируем центральным значением
+volatile unsigned long tiltPulseStart = 0;
+volatile unsigned long tiltPulseWidth = 1500; // Инициализируем центральным значением
+
+// Переменные для фильтрации значений
+unsigned long lastPanValue = 1500;
+unsigned long lastTiltValue = 1500;
+const int DEAD_ZONE = 15;         // Мертвая зона для подавления дрожания
+
+// Флаги для определения готовности данных
+volatile bool panUpdated = false;
+volatile bool tiltUpdated = false;
+
+// Параметры PWM сигнала
+const int PWM_MIN = 1000;         // Минимальная длительность импульса (мкс)
+const int PWM_MAX = 2000;         // Максимальная длительность импульса (мкс)
+const int PWM_CENTER = 1500;      // Центральное положение (мкс)
+
+// Параметры для подавления выбросов
+const int MAX_ALLOWED_JUMP = 300;   // Максимально допустимый скачок PWM за одно измерение (мкс)
+const int MIN_VALID_PULSE = 800;    // Минимальный валидный импульс (мкс)
+const int MAX_VALID_PULSE = 2200;   // Максимальный валидный импульс (мкс)
+const int FILTER_SAMPLES = 3;       // Количество семплов для медианного фильтра
+
+// Буферы для медианного фильтра
+unsigned long panBuffer[FILTER_SAMPLES];
+unsigned long tiltBuffer[FILTER_SAMPLES];
+int panBufferIndex = 0;
+int tiltBufferIndex = 0;
+
+// Таймаут для определения потери сигнала
+const unsigned long SIGNAL_TIMEOUT = 500000; // 500 мс
+
+// ПРОТОТИПЫ ФУНКЦИЙ
+void IRAM_ATTR panPulseInterrupt();
+void IRAM_ATTR tiltPulseInterrupt();
+int applyInversion(int angle, bool invert);
+int mapPWMToAngle(unsigned long pwmValue, int minAngle, int maxAngle, bool invert);
+unsigned long medianFilter(unsigned long *buffer, int size);
+bool validatePulse(unsigned long pulseWidth);
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("ESP32 Pan/Tilt контроллер запущен");
+  
+  // Инициализация буферов медианного фильтра
+  for (int i = 0; i < FILTER_SAMPLES; i++) {
+    panBuffer[i] = PWM_CENTER;
+    tiltBuffer[i] = PWM_CENTER;
+  }
+  
+  // Проверка и коррекция настроек углов
+  panMinAngle = constrain(panMinAngle, 0, 180);
+  panMaxAngle = constrain(panMaxAngle, 0, 180);
+  tiltMinAngle = constrain(tiltMinAngle, 0, 180);
+  tiltMaxAngle = constrain(tiltMaxAngle, 0, 180);
+  
+  // Убеждаемся, что min < max
+  if (panMinAngle > panMaxAngle) {
+    int temp = panMinAngle;
+    panMinAngle = panMaxAngle;
+    panMaxAngle = temp;
+    Serial.println("Предупреждение: minPan > maxPan, значения поменяны местами");
+  }
+  
+  if (tiltMinAngle > tiltMaxAngle) {
+    int temp = tiltMinAngle;
+    tiltMinAngle = tiltMaxAngle;
+    tiltMaxAngle = temp;
+    Serial.println("Предупреждение: minTilt > maxTilt, значения поменяны местами");
+  }
+  
+  // Вывод текущих настроек
+  Serial.println("\n--- ТЕКУЩИЕ НАСТРОЙКИ ---");
+  Serial.print("Инверсия Pan: ");
+  Serial.println(invertPan ? "ВКЛ" : "ВЫКЛ");
+  Serial.print("Инверсия Tilt: ");
+  Serial.println(invertTilt ? "ВКЛ" : "ВЫКЛ");
+  Serial.print("Диапазон Pan: ");
+  Serial.print(panMinAngle);
+  Serial.print("° - ");
+  Serial.print(panMaxAngle);
+  Serial.println("°");
+  Serial.print("Диапазон Tilt: ");
+  Serial.print(tiltMinAngle);
+  Serial.print("° - ");
+  Serial.print(tiltMaxAngle);
+  Serial.println("°");
+  Serial.println("-------------------------\n");
+  
+  // Настройка пинов для приема PWM сигналов
+  pinMode(PAN_INPUT_PIN, INPUT_PULLUP);
+  pinMode(TILT_INPUT_PIN, INPUT_PULLUP);
+  
+  // Подключение сервоприводов
+  panServo.attach(PAN_SERVO_PIN);
+  tiltServo.attach(TILT_SERVO_PIN);
+  
+  // Установка сервоприводов в центральное положение с учетом ограничений
+  int panCenter = (panMinAngle + panMaxAngle) / 2;
+  int tiltCenter = (tiltMinAngle + tiltMaxAngle) / 2;
+  
+  // Применяем инверсию для центрального положения если нужно
+  int finalPanCenter = applyInversion(panCenter, invertPan);
+  int finalTiltCenter = applyInversion(tiltCenter, invertTilt);
+  
+  panServo.write(finalPanCenter);
+  tiltServo.write(finalTiltCenter);
+  
+  Serial.print("Центр Pan: ");
+  Serial.print(panCenter);
+  Serial.print("°");
+  if (invertPan) {
+    Serial.print(" (инв. -> ");
+    Serial.print(finalPanCenter);
+    Serial.print("°)");
+  }
+  Serial.print(", Центр Tilt: ");
+  Serial.print(tiltCenter);
+  Serial.print("°");
+  if (invertTilt) {
+    Serial.print(" (инв. -> ");
+    Serial.print(finalTiltCenter);
+    Serial.print("°)");
+  }
+  Serial.println("\n");
+  
+  // Настройка аппаратных прерываний
+  attachInterrupt(digitalPinToInterrupt(PAN_INPUT_PIN), panPulseInterrupt, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(TILT_INPUT_PIN), tiltPulseInterrupt, CHANGE);
+  
+  Serial.println("Прерывания настроены");
+  Serial.println("Жду сигналы с приемника...\n");
+}
+
+void loop() {
+  static unsigned long lastPanValidValue = PWM_CENTER;
+  static unsigned long lastTiltValidValue = PWM_CENTER;
+  
+  // Обработка сигнала Pan канала
+  if (panUpdated) {
+    noInterrupts();
+    unsigned long pulseWidth = panPulseWidth;
+    panUpdated = false;
+    interrupts();
+    
+    // Валидация импульса
+    if (validatePulse(pulseWidth)) {
+      // Добавляем в буфер медианного фильтра
+      panBuffer[panBufferIndex] = pulseWidth;
+      panBufferIndex = (panBufferIndex + 1) % FILTER_SAMPLES;
+      
+      // Применяем медианный фильтр
+      unsigned long filteredPulse = medianFilter(panBuffer, FILTER_SAMPLES);
+      
+      // Проверяем на резкие скачки
+      if (abs((long)filteredPulse - (long)lastPanValidValue) < MAX_ALLOWED_JUMP) {
+        // Плавное изменение - принимаем значение
+        lastPanValidValue = filteredPulse;
+        
+        // Применяем фильтрацию для сглаживания
+        if (abs((long)filteredPulse - (long)lastPanValue) > DEAD_ZONE) {
+          lastPanValue = filteredPulse;
+          
+          // Преобразование PWM в угол с учетом ограничений и инверсии
+          int finalPanAngle = mapPWMToAngle(filteredPulse, panMinAngle, panMaxAngle, invertPan);
+          
+          // Управление сервоприводом
+          panServo.write(finalPanAngle);
+          
+          // Для отладки показываем промежуточные значения
+          int rawMappedAngle = map(filteredPulse, PWM_MIN, PWM_MAX, 0, 180);
+          rawMappedAngle = constrain(rawMappedAngle, 0, 180);
+          
+          Serial.print("Pan PWM: ");
+          Serial.print(filteredPulse);
+          Serial.print(" мкс -> RAW: ");
+          Serial.print(rawMappedAngle);
+          Serial.print("° -> Ограничен: [");
+          Serial.print(panMinAngle);
+          Serial.print("-");
+          Serial.print(panMaxAngle);
+          Serial.print("] -> ");
+          Serial.print(finalPanAngle);
+          Serial.println("°");
+        }
+      } else {
+        Serial.print("Игнорирование резкого скачка Pan: ");
+        Serial.print(filteredPulse);
+        Serial.print(" мкс (пред. ");
+        Serial.print(lastPanValidValue);
+        Serial.println(" мкс)");
+      }
+    }
+  }
+  
+  // Обработка сигнала Tilt канала
+  if (tiltUpdated) {
+    noInterrupts();
+    unsigned long pulseWidth = tiltPulseWidth;
+    tiltUpdated = false;
+    interrupts();
+    
+    // Валидация импульса
+    if (validatePulse(pulseWidth)) {
+      // Добавляем в буфер медианного фильтра
+      tiltBuffer[tiltBufferIndex] = pulseWidth;
+      tiltBufferIndex = (tiltBufferIndex + 1) % FILTER_SAMPLES;
+      
+      // Применяем медианный фильтр
+      unsigned long filteredPulse = medianFilter(tiltBuffer, FILTER_SAMPLES);
+      
+      // Проверяем на резкие скачки
+      if (abs((long)filteredPulse - (long)lastTiltValidValue) < MAX_ALLOWED_JUMP) {
+        // Плавное изменение - принимаем значение
+        lastTiltValidValue = filteredPulse;
+        
+        // Применяем фильтрацию для сглаживания
+        if (abs((long)filteredPulse - (long)lastTiltValue) > DEAD_ZONE) {
+          lastTiltValue = filteredPulse;
+          
+          // Преобразование PWM в угол с учетом ограничений и инверсии
+          int finalTiltAngle = mapPWMToAngle(filteredPulse, tiltMinAngle, tiltMaxAngle, invertTilt);
+          
+          // Управление сервоприводом
+          tiltServo.write(finalTiltAngle);
+          
+          // Для отладки показываем промежуточные значения
+          int rawMappedAngle = map(filteredPulse, PWM_MIN, PWM_MAX, 0, 180);
+          rawMappedAngle = constrain(rawMappedAngle, 0, 180);
+          
+          Serial.print("Tilt PWM: ");
+          Serial.print(filteredPulse);
+          Serial.print(" мкс -> RAW: ");
+          Serial.print(rawMappedAngle);
+          Serial.print("° -> Ограничен: [");
+          Serial.print(tiltMinAngle);
+          Serial.print("-");
+          Serial.print(tiltMaxAngle);
+          Serial.print("] -> ");
+          Serial.print(finalTiltAngle);
+          Serial.println("°");
+        }
+      } else {
+        Serial.print("Игнорирование резкого скачка Tilt: ");
+        Serial.print(filteredPulse);
+        Serial.print(" мкс (пред. ");
+        Serial.print(lastTiltValidValue);
+        Serial.println(" мкс)");
+      }
+    }
+  }
+  
+  // Проверка потери сигнала
+  static unsigned long lastCheck = 0;
+  
+  if (micros() - lastCheck > 100000) { // Проверка каждые 100 мс
+    lastCheck = micros();
+    
+    noInterrupts();
+    unsigned long panCurrent = panPulseWidth;
+    unsigned long tiltCurrent = tiltPulseWidth;
+    interrupts();
+    
+    // Если сигнал пропал, установить сервоприводы в безопасное положение
+    if (!validatePulse(panCurrent)) {
+      int panCenter = (panMinAngle + panMaxAngle) / 2;
+      int centerWithInversion = applyInversion(panCenter, invertPan);
+      panServo.write(centerWithInversion);
+      Serial.println("!!! Потеря сигнала Pan! Возврат в центр.");
+    }
+    
+    if (!validatePulse(tiltCurrent)) {
+      int tiltCenter = (tiltMinAngle + tiltMaxAngle) / 2;
+      int centerWithInversion = applyInversion(tiltCenter, invertTilt);
+      tiltServo.write(centerWithInversion);
+      Serial.println("!!! Потеря сигнала Tilt! Возврат в центр.");
+    }
+  }
+  
+  // Небольшая задержка для стабильности
+  delay(2);
+}
+
+// Функция валидации импульса
+bool validatePulse(unsigned long pulseWidth) {
+  return (pulseWidth >= MIN_VALID_PULSE && pulseWidth <= MAX_VALID_PULSE);
+}
+
+// Функция медианного фильтра
+unsigned long medianFilter(unsigned long *buffer, int size) {
+  // Создаем копию буфера для сортировки
+  unsigned long sorted[size];
+  for (int i = 0; i < size; i++) {
+    sorted[i] = buffer[i];
+  }
+  
+  // Сортировка пузырьком для малого размера буфера
+  for (int i = 0; i < size - 1; i++) {
+    for (int j = 0; j < size - i - 1; j++) {
+      if (sorted[j] > sorted[j + 1]) {
+        unsigned long temp = sorted[j];
+        sorted[j] = sorted[j + 1];
+        sorted[j + 1] = temp;
+      }
+    }
+  }
+  
+  // Возвращаем медиану
+  return sorted[size / 2];
+}
+
+// НОВАЯ ФУНКЦИЯ: преобразование PWM в угол с использованием всего диапазона
+int mapPWMToAngle(unsigned long pwmValue, int minAngle, int maxAngle, bool invert) {
+  // Сначала маппим PWM на полный диапазон 0-180
+  int fullAngle = map(pwmValue, PWM_MIN, PWM_MAX, 0, 180);
+  fullAngle = constrain(fullAngle, 0, 180);
+  
+  // Теперь маппим полный диапазон на ограниченный диапазон
+  // Например: если min=55, max=125, то:
+  // PWM 1000 -> fullAngle=0 -> ограниченный угол = 55
+  // PWM 1500 -> fullAngle=90 -> ограниченный угол = 90
+  // PWM 2000 -> fullAngle=180 -> ограниченный угол = 125
+  int limitedAngle = map(fullAngle, 0, 180, minAngle, maxAngle);
+  limitedAngle = constrain(limitedAngle, minAngle, maxAngle);
+  
+  // Применяем инверсию если нужно
+  if (invert) {
+    // Инвертируем относительно ограниченного диапазона
+    return maxAngle - (limitedAngle - minAngle);
+  }
+  
+  return limitedAngle;
+}
+
+// Функция для применения инверсии к углу сервопривода (упрощенная, для центрирования)
+int applyInversion(int angle, bool invert) {
+  if (invert) {
+    return 180 - angle;
+  }
+  return angle;
+}
+
+// Прерывание для измерения PWM сигнала Pan канала
+void IRAM_ATTR panPulseInterrupt() {
+  static unsigned long lastInterruptTime = 0;
+  unsigned long currentTime = micros();
+  
+  // Защита от дребезга
+  if (currentTime - lastInterruptTime < 50) {
+    return;
+  }
+  lastInterruptTime = currentTime;
+  
+  if (digitalRead(PAN_INPUT_PIN) == HIGH) {
+    panPulseStart = currentTime;
+  } else {
+    if (panPulseStart != 0) {
+      unsigned long width = currentTime - panPulseStart;
+      // Проверка на валидность длины импульса
+      if (width >= 500 && width <= 2500) {
+        panPulseWidth = width;
+        panUpdated = true;
+      }
+    }
+  }
+}
+
+// Прерывание для измерения PWM сигнала Tilt канала
+void IRAM_ATTR tiltPulseInterrupt() {
+  static unsigned long lastInterruptTime = 0;
+  unsigned long currentTime = micros();
+  
+  // Защита от дребезга
+  if (currentTime - lastInterruptTime < 50) {
+    return;
+  }
+  lastInterruptTime = currentTime;
+  
+  if (digitalRead(TILT_INPUT_PIN) == HIGH) {
+    tiltPulseStart = currentTime;
+  } else {
+    if (tiltPulseStart != 0) {
+      unsigned long width = currentTime - tiltPulseStart;
+      // Проверка на валидность длины импульса
+      if (width >= 500 && width <= 2500) {
+        tiltPulseWidth = width;
+        tiltUpdated = true;
+      }
+    }
+  }
+}
+
+
+
+
+
+Ключевые изменения:
+
+    Новая функция mapPWMToAngle (строки 270-291):
+    cpp
+
+    int mapPWMToAngle(unsigned long pwmValue, int minAngle, int maxAngle, bool invert)
+
+        Сначала преобразует PWM в полный диапазон (0-180°)
+
+        Затем маппит полный диапазон на ограниченный (например, 55-125°)
+
+        Применяет инверсию если нужно
+
+    Логика работы:
+
+        PWM 1000 мкс (мин) -> Полный угол 0° -> Ограниченный угол = minAngle (55°)
+
+        PWM 1500 мкс (центр) -> Полный угол 90° -> Ограниченный угол = середина диапазона (90°)
+
+        PWM 2000 мкс (макс) -> Полный угол 180° -> Ограниченный угол = maxAngle (125°)
+
+    Улучшенный вывод в Serial:
+    text
+
+    Pan PWM: 1000 мкс -> RAW: 0° -> Ограничен: [55-125] -> 55°
+    Pan PWM: 1500 мкс -> RAW: 90° -> Ограничен: [55-125] -> 90°
+    Pan PWM: 2000 мкс -> RAW: 180° -> Ограничен: [55-125] -> 125°
+
+Примеры работы с вашими настройками:
+cpp
+
+int tiltMinAngle = 55;    // Нижняя граница
+int tiltMaxAngle = 125;   // Верхняя граница
+
+Положение джойстика	PWM сигнал	Полный угол	Итоговый угол Tilt
+Минимум (вниз)	1000 мкс	0°	55°
+Центр	1500 мкс	90°	90°
+Максимум (вверх)	2000 мкс	180°	125°
+Преимущества:
+
+    Полное использование диапазона джойстика - даже при ограниченном ходе сервопривода
+
+    Плавное управление - каждое движение джойстика пропорционально двигает сервопривод
+
+    Точное позиционирование - максимальное разрешение управления
+
+    Инверсия работает корректно - инвертирует уже ограниченный диапазон
+
+Теперь при перемещении джойстика от упора до упора, сервопривод будет плавно двигаться точно от минимального установленного угла до максимального!
