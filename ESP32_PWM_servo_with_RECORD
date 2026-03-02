@@ -1,0 +1,779 @@
+#include <ESP32Servo.h>
+
+// Пины для подключения сервоприводов
+const int PAN_SERVO_PIN = 18;    // Пин для сервопривода Pan (горизонтальное вращение)
+const int TILT_SERVO_PIN = 19;   // Пин для сервопривода Tilt (вертикальное вращение)
+
+// Пины для приема сигналов с радиоприемника
+const int PAN_INPUT_PIN = 4;     // Пин для приема PWM сигнала Pan канала
+const int TILT_INPUT_PIN = 5;    // Пин для приема PWM сигнала Tilt канала
+const int RECORD_INPUT_PIN = 15;  // Пин для приема PWM сигнала с тумблера записи/воспроизведения
+
+// НАСТРОЙКИ ИНВЕРТИРОВАНИЯ КАНАЛОВ
+bool invertPan = false;           // true - инвертировать Pan канал, false - нормальное направление
+bool invertTilt = false;          // true - инвертировать Tilt канал, false - нормальное направление
+
+// НАСТРОЙКИ ОГРАНИЧЕНИЯ УГЛОВ ПОВОРОТА (в градусах)
+int panMinAngle = 60;             // Минимальный угол для Pan сервопривода (0-180)
+int panMaxAngle = 120;            // Максимальный угол для Pan сервопривода (0-180)
+int tiltMinAngle = 55;            // Минимальный угол для Tilt сервопривода (0-180)
+int tiltMaxAngle = 125;           // Максимальный угол для Tilt сервопривода (0-180)
+
+// НАСТРОЙКИ ЗАПИСИ ТРАЕКТОРИИ
+const int MAX_TRAJECTORY_POINTS = 500;   // Максимальное количество точек траектории
+const int RECORDING_INTERVAL = 50;       // Интервал записи точек в миллисекундах (20 Гц)
+const int PLAYBACK_SPEED = 100;          // Скорость воспроизведения в процентах (100 = нормальная)
+const int PAUSE_BETWEEN_CYCLES = 1000;   // Пауза между циклами воспроизведения в мс (1 секунда)
+
+// Структура для хранения точки траектории
+struct TrajectoryPoint {
+  int panAngle;
+  int tiltAngle;
+  unsigned long timestamp;  // Время от начала записи в мс
+};
+
+// Массив для хранения траектории
+TrajectoryPoint trajectory[MAX_TRAJECTORY_POINTS];
+int trajectoryLength = 0;           // Текущая длина траектории
+bool isRecording = false;           // Флаг записи
+bool isPlaying = false;             // Флаг воспроизведения
+bool isLooping = false;             // Флаг циклического режима
+unsigned long recordingStartTime = 0;  // Время начала записи
+unsigned long playbackStartTime = 0;    // Время начала текущего цикла воспроизведения
+unsigned long loopPauseStartTime = 0;   // Время начала паузы между циклами
+int playbackIndex = 0;              // Текущий индекс при воспроизведении
+int currentLoop = 0;                // Счетчик циклов воспроизведения
+bool isPaused = false;              // Флаг паузы между циклами
+
+// Создаем объекты для сервоприводов
+Servo panServo;
+Servo tiltServo;
+
+// Переменные для хранения длительности импульсов
+volatile unsigned long panPulseStart = 0;
+volatile unsigned long panPulseWidth = 1500;  // Инициализируем центральным значением
+volatile unsigned long tiltPulseStart = 0;
+volatile unsigned long tiltPulseWidth = 1500; // Инициализируем центральным значением
+volatile unsigned long recordPulseStart = 0;
+volatile unsigned long recordPulseWidth = 1500; // Сигнал с тумблера
+
+// Переменные для фильтрации значений
+unsigned long lastPanValue = 1500;
+unsigned long lastTiltValue = 1500;
+const int DEAD_ZONE = 15;         // Мертвая зона для подавления дрожания
+
+// Флаги для определения готовности данных
+volatile bool panUpdated = false;
+volatile bool tiltUpdated = false;
+volatile bool recordUpdated = false;
+
+// Параметры PWM сигнала
+const int PWM_MIN = 1000;         // Минимальная длительность импульса (мкс)
+const int PWM_MAX = 2000;         // Максимальная длительность импульса (мкс)
+const int PWM_CENTER = 1500;      // Центральное положение (мкс)
+const int PWM_THRESHOLD = 150;    // Порог для определения положения тумблера (отклонение от центра)
+
+// Параметры для подавления выбросов
+const int MAX_ALLOWED_JUMP = 300;   // Максимально допустимый скачок PWM за одно измерение (мкс)
+const int MIN_VALID_PULSE = 800;    // Минимальный валидный импульс (мкс)
+const int MAX_VALID_PULSE = 2200;   // Максимальный валидный импульс (мкс)
+const int FILTER_SAMPLES = 3;       // Количество семплов для медианного фильтра
+
+// Буферы для медианного фильтра
+unsigned long panBuffer[FILTER_SAMPLES];
+unsigned long tiltBuffer[FILTER_SAMPLES];
+unsigned long recordBuffer[FILTER_SAMPLES];
+int panBufferIndex = 0;
+int tiltBufferIndex = 0;
+int recordBufferIndex = 0;
+
+// Переменные для хранения состояния тумблера
+int lastRecordState = 0;  // 0 - центр, 1 - запись, 2 - воспроизведение
+unsigned long debounceTime = 0;
+const unsigned long DEBOUNCE_DELAY = 300; // Задержка для антидребезга тумблера
+
+// Таймаут для определения потери сигнала
+const unsigned long SIGNAL_TIMEOUT = 500000; // 500 мс
+
+// ПРОТОТИПЫ ФУНКЦИЙ
+void IRAM_ATTR panPulseInterrupt();
+void IRAM_ATTR tiltPulseInterrupt();
+void IRAM_ATTR recordPulseInterrupt();
+int applyInversion(int angle, bool invert);
+int mapPWMToAngle(unsigned long pwmValue, int minAngle, int maxAngle, bool invert);
+unsigned long medianFilter(unsigned long *buffer, int size);
+bool validatePulse(unsigned long pulseWidth);
+int getSwitchPosition(unsigned long pwmValue);
+void startRecording();
+void stopRecording();
+void startPlayback();
+void stopPlayback();
+void clearTrajectory();
+void processRecording();
+void processPlayback();
+void returnToManualControl();
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("ESP32 Pan/Tilt контроллер с циклическим воспроизведением траектории");
+  
+  // Инициализация буферов медианного фильтра
+  for (int i = 0; i < FILTER_SAMPLES; i++) {
+    panBuffer[i] = PWM_CENTER;
+    tiltBuffer[i] = PWM_CENTER;
+    recordBuffer[i] = PWM_CENTER;
+  }
+  
+  // Проверка и коррекция настроек углов
+  panMinAngle = constrain(panMinAngle, 0, 180);
+  panMaxAngle = constrain(panMaxAngle, 0, 180);
+  tiltMinAngle = constrain(tiltMinAngle, 0, 180);
+  tiltMaxAngle = constrain(tiltMaxAngle, 0, 180);
+  
+  // Убеждаемся, что min < max
+  if (panMinAngle > panMaxAngle) {
+    int temp = panMinAngle;
+    panMinAngle = panMaxAngle;
+    panMaxAngle = temp;
+    Serial.println("Предупреждение: minPan > maxPan, значения поменяны местами");
+  }
+  
+  if (tiltMinAngle > tiltMaxAngle) {
+    int temp = tiltMinAngle;
+    tiltMinAngle = tiltMaxAngle;
+    tiltMaxAngle = temp;
+    Serial.println("Предупреждение: minTilt > maxTilt, значения поменяны местами");
+  }
+  
+  // Вывод текущих настроек
+  Serial.println("\n--- ТЕКУЩИЕ НАСТРОЙКИ ---");
+  Serial.print("Инверсия Pan: ");
+  Serial.println(invertPan ? "ВКЛ" : "ВЫКЛ");
+  Serial.print("Инверсия Tilt: ");
+  Serial.println(invertTilt ? "ВКЛ" : "ВЫКЛ");
+  Serial.print("Диапазон Pan: ");
+  Serial.print(panMinAngle);
+  Serial.print("° - ");
+  Serial.print(panMaxAngle);
+  Serial.println("°");
+  Serial.print("Диапазон Tilt: ");
+  Serial.print(tiltMinAngle);
+  Serial.print("° - ");
+  Serial.print(tiltMaxAngle);
+  Serial.println("°");
+  Serial.println("-------------------------\n");
+  
+  // Настройка пинов для приема PWM сигналов
+  pinMode(PAN_INPUT_PIN, INPUT_PULLUP);
+  pinMode(TILT_INPUT_PIN, INPUT_PULLUP);
+  pinMode(RECORD_INPUT_PIN, INPUT_PULLUP);
+  
+  // Подключение сервоприводов
+  panServo.attach(PAN_SERVO_PIN);
+  tiltServo.attach(TILT_SERVO_PIN);
+  
+  // Установка сервоприводов в центральное положение с учетом ограничений
+  int panCenter = (panMinAngle + panMaxAngle) / 2;
+  int tiltCenter = (tiltMinAngle + tiltMaxAngle) / 2;
+  
+  // Применяем инверсию для центрального положения если нужно
+  int finalPanCenter = applyInversion(panCenter, invertPan);
+  int finalTiltCenter = applyInversion(tiltCenter, invertTilt);
+  
+  panServo.write(finalPanCenter);
+  tiltServo.write(finalTiltCenter);
+  
+  Serial.print("Центр Pan: ");
+  Serial.print(panCenter);
+  Serial.print("°");
+  if (invertPan) {
+    Serial.print(" (инв. -> ");
+    Serial.print(finalPanCenter);
+    Serial.print("°)");
+  }
+  Serial.print(", Центр Tilt: ");
+  Serial.print(tiltCenter);
+  Serial.print("°");
+  if (invertTilt) {
+    Serial.print(" (инв. -> ");
+    Serial.print(finalTiltCenter);
+    Serial.print("°)");
+  }
+  Serial.println("\n");
+  
+  // Настройка аппаратных прерываний
+  attachInterrupt(digitalPinToInterrupt(PAN_INPUT_PIN), panPulseInterrupt, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(TILT_INPUT_PIN), tiltPulseInterrupt, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(RECORD_INPUT_PIN), recordPulseInterrupt, CHANGE);
+  
+  Serial.println("Прерывания настроены");
+  Serial.println("Жду сигналы с приемника...\n");
+  Serial.println("УПРАВЛЕНИЕ:");
+  Serial.println("  Тумблер вверх (>1650 мкс) -> НАЧАТЬ ЗАПИСЬ");
+  Serial.println("  Тумблер вниз (<1350 мкс) -> ЦИКЛИЧЕСКОЕ ВОСПРОИЗВЕДЕНИЕ (бесконечно)");
+  Serial.println("  Тумблер в центре -> ОСТАНОВКА (возврат в ручной режим)\n");
+}
+
+void loop() {
+  static unsigned long lastPanValidValue = PWM_CENTER;
+  static unsigned long lastTiltValidValue = PWM_CENTER;
+  static unsigned long lastRecordCheck = 0;
+  
+  // Обработка сигнала Record канала (тумблер)
+  if (recordUpdated) {
+    noInterrupts();
+    unsigned long pulseWidth = recordPulseWidth;
+    recordUpdated = false;
+    interrupts();
+    
+    if (validatePulse(pulseWidth)) {
+      // Добавляем в буфер медианного фильтра
+      recordBuffer[recordBufferIndex] = pulseWidth;
+      recordBufferIndex = (recordBufferIndex + 1) % FILTER_SAMPLES;
+      
+      // Применяем медианный фильтр
+      unsigned long filteredPulse = medianFilter(recordBuffer, FILTER_SAMPLES);
+      
+      // Определяем положение тумблера с антидребезгом
+      int currentState = getSwitchPosition(filteredPulse);
+      
+      if (millis() - lastRecordCheck > DEBOUNCE_DELAY) {
+        if (currentState != lastRecordState) {
+          lastRecordState = currentState;
+          
+          // Обработка состояний тумблера
+          if (currentState == 1) { // Тумблер вверх - запись
+            if (!isRecording) {
+              if (isPlaying) {
+                stopPlayback();
+              }
+              startRecording();
+            }
+          } 
+          else if (currentState == 2) { // Тумблер вниз - циклическое воспроизведение
+            if (!isPlaying && trajectoryLength > 0) {
+              if (isRecording) {
+                stopRecording();
+              }
+              startPlayback();
+            } else if (isPlaying) {
+              // Если уже играет, ничего не делаем (продолжаем циклы)
+              Serial.println("Продолжаем циклическое воспроизведение...");
+            }
+          }
+          else { // Тумблер в центре - остановка всего
+            if (isRecording) {
+              stopRecording();
+              Serial.print("Запись остановлена. Сохранено точек: ");
+              Serial.println(trajectoryLength);
+            }
+            if (isPlaying) {
+              stopPlayback();
+              Serial.println("Циклическое воспроизведение остановлено");
+            }
+            // Возвращаемся в ручной режим управления
+            returnToManualControl();
+          }
+        }
+        lastRecordCheck = millis();
+      }
+    }
+  }
+  
+  // Обработка сигнала Pan канала (только если не в режиме воспроизведения)
+  if (!isPlaying && panUpdated) {
+    noInterrupts();
+    unsigned long pulseWidth = panPulseWidth;
+    panUpdated = false;
+    interrupts();
+    
+    // Валидация импульса
+    if (validatePulse(pulseWidth)) {
+      // Добавляем в буфер медианного фильтра
+      panBuffer[panBufferIndex] = pulseWidth;
+      panBufferIndex = (panBufferIndex + 1) % FILTER_SAMPLES;
+      
+      // Применяем медианный фильтр
+      unsigned long filteredPulse = medianFilter(panBuffer, FILTER_SAMPLES);
+      
+      // Проверяем на резкие скачки
+      if (abs((long)filteredPulse - (long)lastPanValidValue) < MAX_ALLOWED_JUMP) {
+        // Плавное изменение - принимаем значение
+        lastPanValidValue = filteredPulse;
+        
+        // Применяем фильтрацию для сглаживания
+        if (abs((long)filteredPulse - (long)lastPanValue) > DEAD_ZONE) {
+          lastPanValue = filteredPulse;
+          
+          // Преобразование PWM в угол с учетом ограничений и инверсии
+          int finalPanAngle = mapPWMToAngle(filteredPulse, panMinAngle, panMaxAngle, invertPan);
+          
+          // Управление сервоприводом
+          panServo.write(finalPanAngle);
+        }
+      }
+    }
+  }
+  
+  // Обработка сигнала Tilt канала (только если не в режиме воспроизведения)
+  if (!isPlaying && tiltUpdated) {
+    noInterrupts();
+    unsigned long pulseWidth = tiltPulseWidth;
+    tiltUpdated = false;
+    interrupts();
+    
+    // Валидация импульса
+    if (validatePulse(pulseWidth)) {
+      // Добавляем в буфер медианного фильтра
+      tiltBuffer[tiltBufferIndex] = pulseWidth;
+      tiltBufferIndex = (tiltBufferIndex + 1) % FILTER_SAMPLES;
+      
+      // Применяем медианный фильтр
+      unsigned long filteredPulse = medianFilter(tiltBuffer, FILTER_SAMPLES);
+      
+      // Проверяем на резкие скачки
+      if (abs((long)filteredPulse - (long)lastTiltValidValue) < MAX_ALLOWED_JUMP) {
+        // Плавное изменение - принимаем значение
+        lastTiltValidValue = filteredPulse;
+        
+        // Применяем фильтрацию для сглаживания
+        if (abs((long)filteredPulse - (long)lastTiltValue) > DEAD_ZONE) {
+          lastTiltValue = filteredPulse;
+          
+          // Преобразование PWM в угол с учетом ограничений и инверсии
+          int finalTiltAngle = mapPWMToAngle(filteredPulse, tiltMinAngle, tiltMaxAngle, invertTilt);
+          
+          // Управление сервоприводом
+          tiltServo.write(finalTiltAngle);
+        }
+      }
+    }
+  }
+  
+  // Обработка записи траектории
+  if (isRecording) {
+    processRecording();
+  }
+  
+  // Обработка циклического воспроизведения траектории
+  if (isPlaying) {
+    processPlayback();
+  }
+  
+  // Проверка потери сигнала
+  static unsigned long lastCheck = 0;
+  
+  if (micros() - lastCheck > 100000) { // Проверка каждые 100 мс
+    lastCheck = micros();
+    
+    noInterrupts();
+    unsigned long panCurrent = panPulseWidth;
+    unsigned long tiltCurrent = tiltPulseWidth;
+    unsigned long recordCurrent = recordPulseWidth;
+    interrupts();
+    
+    // Если сигнал пропал, установить сервоприводы в безопасное положение
+    if (!validatePulse(panCurrent) && !isPlaying) {
+      int panCenter = (panMinAngle + panMaxAngle) / 2;
+      int centerWithInversion = applyInversion(panCenter, invertPan);
+      panServo.write(centerWithInversion);
+      Serial.println("!!! Потеря сигнала Pan! Возврат в центр.");
+    }
+    
+    if (!validatePulse(tiltCurrent) && !isPlaying) {
+      int tiltCenter = (tiltMinAngle + tiltMaxAngle) / 2;
+      int centerWithInversion = applyInversion(tiltCenter, invertTilt);
+      tiltServo.write(centerWithInversion);
+      Serial.println("!!! Потеря сигнала Tilt! Возврат в центр.");
+    }
+    
+    // При потере сигнала тумблера - останавливаем запись/воспроизведение
+    if (!validatePulse(recordCurrent)) {
+      if (isRecording) {
+        stopRecording();
+        Serial.println("!!! Потеря сигнала тумблера! Запись остановлена.");
+        returnToManualControl();
+      }
+      if (isPlaying) {
+        stopPlayback();
+        Serial.println("!!! Потеря сигнала тумблера! Воспроизведение остановлено.");
+        returnToManualControl();
+      }
+    }
+  }
+  
+  // Небольшая задержка для стабильности
+  delay(2);
+}
+
+// Функция валидации импульса
+bool validatePulse(unsigned long pulseWidth) {
+  return (pulseWidth >= MIN_VALID_PULSE && pulseWidth <= MAX_VALID_PULSE);
+}
+
+// Функция медианного фильтра
+unsigned long medianFilter(unsigned long *buffer, int size) {
+  // Создаем копию буфера для сортировки
+  unsigned long sorted[size];
+  for (int i = 0; i < size; i++) {
+    sorted[i] = buffer[i];
+  }
+  
+  // Сортировка пузырьком для малого размера буфера
+  for (int i = 0; i < size - 1; i++) {
+    for (int j = 0; j < size - i - 1; j++) {
+      if (sorted[j] > sorted[j + 1]) {
+        unsigned long temp = sorted[j];
+        sorted[j] = sorted[j + 1];
+        sorted[j + 1] = temp;
+      }
+    }
+  }
+  
+  // Возвращаем медиану
+  return sorted[size / 2];
+}
+
+// Функция определения положения тумблера по PWM
+int getSwitchPosition(unsigned long pwmValue) {
+  if (pwmValue > PWM_CENTER + PWM_THRESHOLD) {
+    return 1; // Тумблер вверх - запись
+  } 
+  else if (pwmValue < PWM_CENTER - PWM_THRESHOLD) {
+    return 2; // Тумблер вниз - воспроизведение
+  } 
+  else {
+    return 0; // Тумблер в центре
+  }
+}
+
+// Функция начала записи
+void startRecording() {
+  clearTrajectory();
+  isRecording = true;
+  recordingStartTime = millis();
+  trajectoryLength = 0;
+  
+  // Записываем первую точку (текущее положение)
+  if (trajectoryLength < MAX_TRAJECTORY_POINTS) {
+    trajectory[trajectoryLength].panAngle = panServo.read();
+    trajectory[trajectoryLength].tiltAngle = tiltServo.read();
+    trajectory[trajectoryLength].timestamp = 0;
+    trajectoryLength++;
+  }
+  
+  Serial.println("\n=== НАЧАЛО ЗАПИСИ ТРАЕКТОРИИ ===");
+  Serial.println("Двигайте сервоприводы с пульта. Тумблер в центр для остановки записи.");
+}
+
+// Функция остановки записи
+void stopRecording() {
+  isRecording = false;
+  Serial.print("\n=== ЗАПИСЬ ОСТАНОВЛЕНА. Точек: ");
+  Serial.print(trajectoryLength);
+  Serial.println(" ===");
+  
+  if (trajectoryLength > 0) {
+    Serial.print("Длительность записи: ");
+    Serial.print(trajectory[trajectoryLength-1].timestamp);
+    Serial.println(" мс");
+  }
+}
+
+// Функция начала циклического воспроизведения
+void startPlayback() {
+  if (trajectoryLength == 0) {
+    Serial.println("!!! Нет записанной траектории для воспроизведения!");
+    return;
+  }
+  
+  isPlaying = true;
+  isLooping = true;
+  currentLoop = 0;
+  isPaused = false;
+  playbackStartTime = millis();
+  playbackIndex = 0;
+  
+  Serial.println("\n=== НАЧАЛО ЦИКЛИЧЕСКОГО ВОСПРОИЗВЕДЕНИЯ ===");
+  Serial.print("Точек в траектории: ");
+  Serial.print(trajectoryLength);
+  Serial.print(", длительность: ");
+  Serial.print(trajectory[trajectoryLength-1].timestamp);
+  Serial.println(" мс");
+  Serial.println("Воспроизведение будет повторяться бесконечно до выключения тумблером.");
+}
+
+// Функция остановки воспроизведения
+void stopPlayback() {
+  isPlaying = false;
+  isLooping = false;
+  isPaused = false;
+  playbackIndex = 0;
+  currentLoop = 0;
+  Serial.println("\n=== ЦИКЛИЧЕСКОЕ ВОСПРОИЗВЕДЕНИЕ ОСТАНОВЛЕНО ===");
+}
+
+// Функция очистки траектории
+void clearTrajectory() {
+  trajectoryLength = 0;
+  playbackIndex = 0;
+  currentLoop = 0;
+}
+
+// Функция возврата в ручной режим управления
+void returnToManualControl() {
+  // Считываем текущие значения с пульта и устанавливаем сервоприводы
+  noInterrupts();
+  unsigned long panCurrent = panPulseWidth;
+  unsigned long tiltCurrent = tiltPulseWidth;
+  interrupts();
+  
+  if (validatePulse(panCurrent)) {
+    int finalPanAngle = mapPWMToAngle(panCurrent, panMinAngle, panMaxAngle, invertPan);
+    panServo.write(finalPanAngle);
+    Serial.print("Возврат в ручной режим. Pan: ");
+    Serial.print(finalPanAngle);
+    Serial.println("°");
+  }
+  
+  if (validatePulse(tiltCurrent)) {
+    int finalTiltAngle = mapPWMToAngle(tiltCurrent, tiltMinAngle, tiltMaxAngle, invertTilt);
+    tiltServo.write(finalTiltAngle);
+    Serial.print("Возврат в ручной режим. Tilt: ");
+    Serial.print(finalTiltAngle);
+    Serial.println("°");
+  }
+}
+
+// Функция обработки записи
+void processRecording() {
+  static unsigned long lastRecordTime = 0;
+  unsigned long currentTime = millis();
+  
+  // Записываем точки с заданным интервалом
+  if (currentTime - lastRecordTime >= RECORDING_INTERVAL) {
+    if (trajectoryLength < MAX_TRAJECTORY_POINTS) {
+      // Сохраняем текущие углы сервоприводов
+      trajectory[trajectoryLength].panAngle = panServo.read();
+      trajectory[trajectoryLength].tiltAngle = tiltServo.read();
+      trajectory[trajectoryLength].timestamp = currentTime - recordingStartTime;
+      
+      // Выводим информацию о записанной точке (каждую 10-ю для уменьшения лога)
+      if (trajectoryLength % 10 == 0) {
+        Serial.print("Запись точки ");
+        Serial.print(trajectoryLength);
+        Serial.print(": Pan=");
+        Serial.print(trajectory[trajectoryLength].panAngle);
+        Serial.print("°, Tilt=");
+        Serial.print(trajectory[trajectoryLength].tiltAngle);
+        Serial.print("°, Время=");
+        Serial.print(trajectory[trajectoryLength].timestamp);
+        Serial.println("мс");
+      }
+      
+      trajectoryLength++;
+      lastRecordTime = currentTime;
+    } else {
+      // Достигнут максимум точек
+      Serial.println("!!! Достигнут максимум точек траектории. Запись остановлена.");
+      stopRecording();
+    }
+  }
+}
+
+// Функция обработки циклического воспроизведения
+void processPlayback() {
+  if (trajectoryLength == 0) {
+    stopPlayback();
+    return;
+  }
+  
+  // Обработка паузы между циклами
+  if (isPaused) {
+    unsigned long currentTime = millis();
+    if (currentTime - loopPauseStartTime >= PAUSE_BETWEEN_CYCLES) {
+      isPaused = false;
+      playbackStartTime = millis();
+      playbackIndex = 0;
+      currentLoop++;
+      
+      Serial.print("Цикл ");
+      Serial.print(currentLoop);
+      Serial.println(": продолжение воспроизведения");
+    }
+    return;
+  }
+  
+  unsigned long currentTime = millis();
+  unsigned long playbackTime = (currentTime - playbackStartTime) * 100 / PLAYBACK_SPEED;
+  unsigned long totalDuration = trajectory[trajectoryLength - 1].timestamp;
+  
+  // Проверяем, не завершился ли текущий цикл
+  if (playbackTime >= totalDuration) {
+    // Цикл завершен, начинаем паузу перед следующим циклом
+    isPaused = true;
+    loopPauseStartTime = millis();
+    
+    Serial.print("✓ Цикл ");
+    Serial.print(currentLoop + 1);
+    Serial.print(" завершен. Пауза ");
+    Serial.print(PAUSE_BETWEEN_CYCLES);
+    Serial.println(" мс перед следующим циклом...");
+    return;
+  }
+  
+  // Ищем точку для текущего времени воспроизведения
+  while (playbackIndex < trajectoryLength - 1 && 
+         trajectory[playbackIndex + 1].timestamp <= playbackTime) {
+    playbackIndex++;
+  }
+  
+  if (playbackIndex < trajectoryLength) {
+    // Получаем целевую точку
+    int targetPan = trajectory[playbackIndex].panAngle;
+    int targetTilt = trajectory[playbackIndex].tiltAngle;
+    
+    // Если есть следующая точка, интерполируем для плавности
+    if (playbackIndex < trajectoryLength - 1) {
+      unsigned long t1 = trajectory[playbackIndex].timestamp;
+      unsigned long t2 = trajectory[playbackIndex + 1].timestamp;
+      
+      if (t2 > t1) {
+        float progress = (float)(playbackTime - t1) / (t2 - t1);
+        progress = constrain(progress, 0.0, 1.0);
+        
+        targetPan = trajectory[playbackIndex].panAngle + 
+                   (trajectory[playbackIndex + 1].panAngle - trajectory[playbackIndex].panAngle) * progress;
+        targetTilt = trajectory[playbackIndex].tiltAngle + 
+                    (trajectory[playbackIndex + 1].tiltAngle - trajectory[playbackIndex].tiltAngle) * progress;
+      }
+    }
+    
+    // Управляем сервоприводами
+    panServo.write(targetPan);
+    tiltServo.write(targetTilt);
+    
+    // Выводим информацию для отладки (только в начале каждого цикла)
+    static bool firstPointDisplayed = false;
+    if (playbackIndex == 0 && !firstPointDisplayed) {
+      Serial.print("Цикл ");
+      Serial.print(currentLoop + 1);
+      Serial.print(": Pan=");
+      Serial.print(targetPan);
+      Serial.print("°, Tilt=");
+      Serial.print(targetTilt);
+      Serial.print("°, Время=");
+      Serial.print(playbackTime);
+      Serial.print("/");
+      Serial.print(totalDuration);
+      Serial.println("мс");
+      firstPointDisplayed = true;
+    }
+    
+    // Сбрасываем флаг при переходе к следующему циклу
+    if (playbackIndex > 0) {
+      firstPointDisplayed = false;
+    }
+  }
+}
+
+// Функция преобразования PWM в угол с использованием всего диапазона
+int mapPWMToAngle(unsigned long pwmValue, int minAngle, int maxAngle, bool invert) {
+  // Сначала маппим PWM на полный диапазон 0-180
+  int fullAngle = map(pwmValue, PWM_MIN, PWM_MAX, 0, 180);
+  fullAngle = constrain(fullAngle, 0, 180);
+  
+  // Теперь маппим полный диапазон на ограниченный диапазон
+  int limitedAngle = map(fullAngle, 0, 180, minAngle, maxAngle);
+  limitedAngle = constrain(limitedAngle, minAngle, maxAngle);
+  
+  // Применяем инверсию если нужно
+  if (invert) {
+    return maxAngle - (limitedAngle - minAngle);
+  }
+  
+  return limitedAngle;
+}
+
+// Функция для применения инверсии к углу сервопривода (упрощенная, для центрирования)
+int applyInversion(int angle, bool invert) {
+  if (invert) {
+    return 180 - angle;
+  }
+  return angle;
+}
+
+// Прерывание для измерения PWM сигнала Pan канала
+void IRAM_ATTR panPulseInterrupt() {
+  static unsigned long lastInterruptTime = 0;
+  unsigned long currentTime = micros();
+  
+  // Защита от дребезга
+  if (currentTime - lastInterruptTime < 50) {
+    return;
+  }
+  lastInterruptTime = currentTime;
+  
+  if (digitalRead(PAN_INPUT_PIN) == HIGH) {
+    panPulseStart = currentTime;
+  } else {
+    if (panPulseStart != 0) {
+      unsigned long width = currentTime - panPulseStart;
+      // Проверка на валидность длины импульса
+      if (width >= 500 && width <= 2500) {
+        panPulseWidth = width;
+        panUpdated = true;
+      }
+    }
+  }
+}
+
+// Прерывание для измерения PWM сигнала Tilt канала
+void IRAM_ATTR tiltPulseInterrupt() {
+  static unsigned long lastInterruptTime = 0;
+  unsigned long currentTime = micros();
+  
+  // Защита от дребезга
+  if (currentTime - lastInterruptTime < 50) {
+    return;
+  }
+  lastInterruptTime = currentTime;
+  
+  if (digitalRead(TILT_INPUT_PIN) == HIGH) {
+    tiltPulseStart = currentTime;
+  } else {
+    if (tiltPulseStart != 0) {
+      unsigned long width = currentTime - tiltPulseStart;
+      // Проверка на валидность длины импульса
+      if (width >= 500 && width <= 2500) {
+        tiltPulseWidth = width;
+        tiltUpdated = true;
+      }
+    }
+  }
+}
+
+// Прерывание для измерения PWM сигнала Record канала
+void IRAM_ATTR recordPulseInterrupt() {
+  static unsigned long lastInterruptTime = 0;
+  unsigned long currentTime = micros();
+  
+  // Защита от дребезга
+  if (currentTime - lastInterruptTime < 50) {
+    return;
+  }
+  lastInterruptTime = currentTime;
+  
+  if (digitalRead(RECORD_INPUT_PIN) == HIGH) {
+    recordPulseStart = currentTime;
+  } else {
+    if (recordPulseStart != 0) {
+      unsigned long width = currentTime - recordPulseStart;
+      // Проверка на валидность длины импульса
+      if (width >= 500 && width <= 2500) {
+        recordPulseWidth = width;
+        recordUpdated = true;
+      }
+    }
+  }
+}
